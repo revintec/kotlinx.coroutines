@@ -994,7 +994,7 @@ internal open class BufferedChannel<E>(
                         if (bufferEndSegment.moveForward(ss)) {
                             ss = findSegmentBufferOrLast(id, ss)
                             if (ss.id != id) return
-                            val i = (b % SEGMENT_SIZE).toInt()
+//                            val i = (b % SEGMENT_SIZE).toInt()
 //                            if (ss.getState(i) === INTERRUPTED_RCV) ss.onSlotCleaned()
                             return
                         }
@@ -1469,8 +1469,8 @@ internal open class BufferedChannel<E>(
     final override fun cancel(cause: CancellationException?) { cancelImpl(cause) }
 
     internal open fun cancelImpl(cause: Throwable?): Boolean {
-        val cause = cause ?: CancellationException("Channel was cancelled")
-        val wasClosed = closeImpl(cause, true)
+        val materializedCause = cause ?: CancellationException("Channel was cancelled")
+        val wasClosed = closeImpl(materializedCause, true)
         removeRemainingBufferedElements()
         onCancel(wasClosed)
         return wasClosed
@@ -1726,6 +1726,7 @@ internal open class BufferedChannel<E>(
     // #######################
 
     private fun findSegmentSend(id: Long, start: ChannelSegment<E>) =
+        @Suppress("INFERRED_TYPE_VARIABLE_INTO_POSSIBLE_EMPTY_INTERSECTION")
         sendSegment.findSegmentAndMoveForward(id, start, ::createSegment).let {
             if (it.isClosed) {
                 completeCloseOrCancel()
@@ -1755,6 +1756,7 @@ internal open class BufferedChannel<E>(
         }
 
     private fun findSegmentReceive(id: Long, start: ChannelSegment<E>) =
+        @Suppress("INFERRED_TYPE_VARIABLE_INTO_POSSIBLE_EMPTY_INTERSECTION")
         receiveSegment.findSegmentAndMoveForward(id, start, ::createSegment).let {
             if (it.isClosed) {
                 completeCloseOrCancel()
@@ -1770,9 +1772,11 @@ internal open class BufferedChannel<E>(
         }
 
     private fun findSegmentHasElements(id: Long, start: ChannelSegment<E>) =
+        @Suppress("INFERRED_TYPE_VARIABLE_INTO_POSSIBLE_EMPTY_INTERSECTION")
         receiveSegment.findSegmentAndMoveForward(id, start, ::createSegment)
 
     private fun findSegmentBuffer(id: Long, start: ChannelSegment<E>) =
+        @Suppress("INFERRED_TYPE_VARIABLE_INTO_POSSIBLE_EMPTY_INTERSECTION")
         bufferEndSegment.findSegmentAndMoveForward(id, start, ::createSegment)
 
     // ##################
@@ -1885,20 +1889,20 @@ internal class ChannelSegment<E>(id: Long, prev: ChannelSegment<E>?, pointers: I
     // # Manipulation with the Element Fields #
     // ########################################
 
-    inline fun storeElement(index: Int, element: E) {
+    internal fun storeElement(index: Int, element: E) {
         setElementLazy(index, element)
     }
 
     @Suppress("UNCHECKED_CAST")
-    inline fun getElement(index: Int) = data[index * 2].value as E
+    internal fun getElement(index: Int) = data[index * 2].value as E
 
-    inline fun retrieveElement(index: Int): E = getElement(index).also { cleanElement(index) }
+    internal fun retrieveElement(index: Int): E = getElement(index).also { cleanElement(index) }
 
-    inline fun cleanElement(index: Int) {
+    internal fun cleanElement(index: Int) {
         setElementLazy(index, null)
     }
 
-    private inline fun setElementLazy(index: Int, value: Any?) {
+    private fun setElementLazy(index: Int, value: Any?) {
         data[index * 2].lazySet(value)
     }
 
@@ -1906,17 +1910,13 @@ internal class ChannelSegment<E>(id: Long, prev: ChannelSegment<E>?, pointers: I
     // # Manipulation with the State Fields #
     // ######################################
 
-    inline fun getState(index: Int): Any? = data[index * 2 + 1].value
+    internal fun getState(index: Int): Any? = data[index * 2 + 1].value
 
-    inline fun setState(index: Int, value: Any?) {
+    internal fun setState(index: Int, value: Any?) {
         data[index * 2 + 1].value = value
     }
 
-    inline fun setStateLazy(index: Int, value: Any?) {
-        data[index * 2 + 1].lazySet(value)
-    }
-
-    inline fun casState(index: Int, from: Any?, to: Any?) = data[index * 2 + 1].compareAndSet(from, to)
+    internal fun casState(index: Int, from: Any?, to: Any?) = data[index * 2 + 1].compareAndSet(from, to)
 
     // ########################
     // # Cancellation Support #
@@ -2119,7 +2119,7 @@ private const val CLOSE_STATUS_SHIFT = 60
 private const val COUNTER_MASK = (1L shl CLOSE_STATUS_SHIFT) - 1
 private inline val Long.counter get() = this and COUNTER_MASK
 private inline val Long.closeStatus: Int get() = (this shr CLOSE_STATUS_SHIFT).toInt()
-private inline fun constructSendersAndCloseStatus(counter: Long, closeStatus: Int): Long =
+private fun constructSendersAndCloseStatus(counter: Long, closeStatus: Int): Long =
     (closeStatus.toLong() shl CLOSE_STATUS_SHIFT) + counter
 
 /*
