@@ -59,7 +59,7 @@ internal open class BufferedChannel<E>(
       point to a special `NULL_SEGMENT` in this case.
      */
     private val sendersAndCloseStatus = atomic(0L)
-    private val receivers = atomic(0L)
+    private val receiversAndCancelStatus = atomic(0L)
     private val bufferEnd = atomic(initialBufferEnd(capacity))
 
     private val rendezvousOrUnlimited
@@ -500,7 +500,7 @@ internal open class BufferedChannel<E>(
 
     /**
      * Checks whether a [send] invocation is bound to suspend if it is called
-     * with the specified [sendersAndCloseStatus], [receivers], and [bufferEnd]
+     * with the specified [sendersAndCloseStatus], [receiversAndCancelStatus], and [bufferEnd]
      * values. When this channel is already closed, the function returns `false`.
      *
      * Specifically, [send] suspends if the channel is not unlimited,
@@ -522,7 +522,7 @@ internal open class BufferedChannel<E>(
      * its element to the working cell without suspension.
      */
     private fun bufferOrRendezvousSend(curSenders: Long): Boolean =
-        curSenders < bufferEnd.value || curSenders < receivers.value
+        curSenders < bufferEnd.value || curSenders < receiversAndCancelStatus.value.counter
 
     /**
      * Checks whether a [send] invocation is bound to suspend if it is called
@@ -707,7 +707,14 @@ internal open class BufferedChannel<E>(
      */
     protected fun tryReceiveInternal(): ChannelResult<E> {
         // Read the `receivers` counter first.
-        val r = receivers.value
+        val r = receiversAndCancelStatus.value.let {
+            if (it.closeStatus == CLOSE_STATUS_CANCELLED || it.closeStatus == CLOSE_STATUS_CANCELLATION_STARTED) {
+                markCancelled()
+                sendersAndCloseStatus.value.isClosedForSend0
+                return closed(getCloseCause())
+            }
+            it
+        }
         val sendersAndCloseStatusCur = sendersAndCloseStatus.value
         // Is this channel closed for send?
         if (sendersAndCloseStatusCur.isClosedForReceive0) return closed(getCloseCause())
@@ -780,7 +787,14 @@ internal open class BufferedChannel<E>(
             //
             // First, we atomically increment the `receivers` counter
             // and obtain the value before the increment.
-            val r = this.receivers.getAndIncrement()
+            val r = this.receiversAndCancelStatus.getAndIncrement().let {
+                if (it.closeStatus == CLOSE_STATUS_CANCELLED || it.closeStatus == CLOSE_STATUS_CANCELLATION_STARTED) {
+                    markCancelled()
+                    sendersAndCloseStatus.value.isClosedForSend0
+                    return onClosed()
+                }
+                it.counter
+            }
             // Count the required segment id and the cell index in it.
             val id = r / SEGMENT_SIZE
             val i = (r % SEGMENT_SIZE).toInt()
@@ -1048,7 +1062,7 @@ internal open class BufferedChannel<E>(
                 }
                 else -> {
                     check(state is Waiter) { "expected Waiter, but $state detected"}
-                    if (b < receivers.value) {
+                    if (b < receiversAndCancelStatus.value.counter) {
                         if (segment.casState(i, state, WaiterEB(waiter = state))) return true
                     } else {
                         if (segment.casState(i, state, S_RESUMING_EB)) {
@@ -1360,10 +1374,14 @@ internal open class BufferedChannel<E>(
             }
         }.also { assert { closeCause.value is Throwable? } }
 
-    private fun markCancelled(): Unit =
+    private fun markCancelled() {
+        receiversAndCancelStatus.update { cur ->
+            constructSendersAndCloseStatus(cur.counter, CLOSE_STATUS_CANCELLED)
+        }
         sendersAndCloseStatus.update { cur ->
             constructSendersAndCloseStatus(cur.counter, CLOSE_STATUS_CANCELLED)
         }
+    }
 
     private fun markCancellationStarted(): Unit =
         sendersAndCloseStatus.update { cur ->
@@ -1487,12 +1505,12 @@ internal open class BufferedChannel<E>(
         }
         while (true) {
             for (i in SEGMENT_SIZE - 1 downTo 0) {
-                if (segm.id * SEGMENT_SIZE + i < receivers.value) return
+                if (segm.id * SEGMENT_SIZE + i < receiversAndCancelStatus.value.counter) return
                 update_cell@while (true) {
                     val state = segm.getState(i)
                     when {
                         state === BUFFERED -> if (segm.casState(i, state, CHANNEL_CLOSED)) {
-                            if (segm.id * SEGMENT_SIZE + i < receivers.value) return
+                            if (segm.id * SEGMENT_SIZE + i < receiversAndCancelStatus.value.counter) return
                             if (onUndeliveredElement != null) {
                                 undeliveredElementException = onUndeliveredElement.callUndeliveredElementCatchingException(segm.retrieveElement(i), undeliveredElementException)
                             }
@@ -1656,7 +1674,14 @@ internal open class BufferedChannel<E>(
         var segm = receiveSegment.value
         while (true) {
             // Is there a chance that this channel has elements?
-            val r = receivers.value
+            val r = receiversAndCancelStatus.value.let {
+                if (it.closeStatus == CLOSE_STATUS_CANCELLED || it.closeStatus == CLOSE_STATUS_CANCELLATION_STARTED) {
+                    markCancelled()
+                    sendersAndCloseStatus.value.isClosedForSend0
+                    return false
+                }
+                it.counter
+            }
             val s = sendersAndCloseStatus.value.counter
             if (s <= r) return false // no elements
             // Try to access the `r`-th cell.
@@ -1680,7 +1705,7 @@ internal open class BufferedChannel<E>(
             val i = (r % SEGMENT_SIZE).toInt()
             if (!isCellEmpty(segm, i, r)) return true
             // The cell is empty. Update `receivers` counter and try again.
-            receivers.compareAndSet(r, r + 1)
+            receiversAndCancelStatus.compareAndSet(r, r + 1)
         }
     }
 
@@ -1716,7 +1741,7 @@ internal open class BufferedChannel<E>(
                 state === DONE_RCV -> return true
                 state === POISONED -> return true
                 state === S_RESUMING_EB || state === S_RESUMING_RCV -> continue // spin-wait
-                else -> return receivers.value != r
+                else -> return receiversAndCancelStatus.value.counter != r
             }
         }
     }
@@ -1750,9 +1775,10 @@ internal open class BufferedChannel<E>(
         }
 
     private fun updateReceiversIfLower(value: Long): Unit =
-        receivers.loop { cur ->
+        receiversAndCancelStatus.loop { cur ->
+            if (cur.closeStatus != CLOSE_STATUS_ACTIVE) return
             if (cur >= value) return
-            if (receivers.compareAndSet(cur, value)) return
+            if (receiversAndCancelStatus.compareAndSet(cur, value)) return
         }
 
     private fun findSegmentReceive(id: Long, start: ChannelSegment<E>) =
@@ -1783,7 +1809,7 @@ internal open class BufferedChannel<E>(
     // # FOR DEBUG INFO #
     // ##################
 
-    internal val receiversCounter: Long get() = receivers.value
+    internal val receiversCounter: Long get() = receiversAndCancelStatus.value.counter
     internal val bufferEndCounter: Long get() = bufferEnd.value
     internal val sendersCounter: Long get() = sendersAndCloseStatus.value.counter
 
@@ -1816,7 +1842,7 @@ internal open class BufferedChannel<E>(
             dataStartIndex++
         }
         while (data.isNotEmpty() && data.last() == "(null,null)") data.removeLast()
-        return "S=${sendersAndCloseStatus.value.counter},R=${receivers.value},B=${bufferEnd.value}," +
+        return "S=${sendersAndCloseStatus.value.counter},R=${receiversAndCancelStatus.value.counter},B=${bufferEnd.value}," +
                "C=${sendersAndCloseStatus.value.closeStatus},data=${data},dataStartIndex=$dataStartIndex," +
                "S_SegmId=${sendSegment.value.id},R_SegmId=${receiveSegment.value.id},B_SegmId=${bufferEndSegment.value.id}"
     }
